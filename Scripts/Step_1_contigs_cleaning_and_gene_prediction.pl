@@ -22,7 +22,13 @@ my $id                = $ARGV[0];
 my $tmp_dir           = $ARGV[1];
 my $fasta_contigs     = $ARGV[2];
 my $th_nb_genes       = $ARGV[3];
-my $path_to_mga       = which('mga_linux_ia64') or die "Cannot find mga_linux_ia64\n";
+my $path_to_mga       = which('mga_linux_ia64');
+my $path_to_mga_bis   = which('mga');
+if ($path_to_mga eq ""){
+	if ($path_to_mga_bis eq ""){die("Couldn't find a path for mga, either mga_linux_ia64 (docker) or mga (conda)")}
+	else{$path_to_mga=$path_to_mga_bis;}
+}
+
 my $in_file           = catfile($tmp_dir, $id . "_nett.fasta");
 my $circu_file        = catfile($tmp_dir, $id . "_circu.list");
 my $out_special_circu = catfile($tmp_dir, $id . "_contigs_circu_temp.fasta");
@@ -95,8 +101,7 @@ if (-e $circu_file){
 	}
 	close $tsv;
 	open my $s3, '>', $out_special_circu;
-	my $long=1000; # we cp the 1000 first bases to the end of the contig
-	my $seuil_long=1000;
+	my $long=10000; # we cp the 10000 first bases to the end of the contig
 	my $n_circu=0;
 	foreach(sort {$order_contig{$a} <=> $order_contig{$b} } keys %circu){
 		my $id_c=$_;

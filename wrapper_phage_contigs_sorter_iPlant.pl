@@ -2,7 +2,7 @@
 
 =head1 SYNOPSIS
 
-  wrapper_phage_contigs_sorter_iPlant.pl --fasta sequences.fa
+  wrapper_phage_contigs_sorter_iPlant.pl --fna sequences.fa
 
 Required Arguments:
 
@@ -13,7 +13,8 @@ Options:
   -d|--dataset   Code dataset (DEFAULT "VIRSorter")
   --cp           Custom phage sequence 
   --db           Either "1" (DEFAULT Refseqdb) or "2" (Viromedb)
-  --wdir         Working directory (DEFAULT cwd)
+  --wdir         Working directory (DEFAULT $PWD/virsorter-out/)
+                 Will be created if not existing.
   --ncpu         Number of CPUs (default: 4)
   --virome       Add this flag to enable virome decontamination mode, for datasets
                  mostly viral to force the use of generic metrics instead of 
@@ -29,6 +30,10 @@ Options:
 		 to save the database and point VirSorter to it in subsequent runs.
                  By default, this is off, and you should only specify this flag if 
 		 you're SURE you need it.
+  --no_c         Use this option if you have issues with empty output files, i.e. 0
+		 viruses predicted by VirSorter. This make VirSorter use a perl function 
+		 instead of the C script to calculate enrichment statistics. Note that 
+		 VirSorter will be slower with this option.
   --help         Show help and exit
 
 =head1 DESCRIPTION
@@ -48,6 +53,7 @@ use File::Which 'which';
 use Getopt::Long 'GetOptions';
 use Pod::Usage;
 use Cwd 'cwd';
+use Term::ANSIColor;
 
 my $help            = '';
 my $code_dataset    = 'VIRSorter';
@@ -61,6 +67,9 @@ my $wdir            = catdir(cwd(), 'virsorter-out');
 my $diamond         = 0;
 my $blastp          = 'blastp';
 my $keepdb          = 0;
+my $debug           = 0;
+my $no_c            = 0;
+my $opt_verbose;
 
 GetOptions(
    'f|fna=s'     => \$input_file,
@@ -74,6 +83,9 @@ GetOptions(
    'diamond'     => \$diamond,
    'keep-db'     => \$keepdb,
    'h|help'      => \$help,
+   'debug'       => \$debug,
+   'no_c'        => \$no_c,
+   'verbose'     => \$opt_verbose,		# Enable verbose output
 );
 
 if ($help) {
@@ -81,15 +93,16 @@ if ($help) {
 }
 
 unless ($input_file) {
-    pod2usage('Missing FASTA file');
+    pod2usage('MISSING PARAMETER: Specify the input FASTA file with --fna FILENAME');
 }
 
 if ($choice_database < 1 || $choice_database > 3) {
-    pod2usage('choice_database must be 1, 2, or 3');
+    pod2usage('WRONG PARAMETER: choice_database must be 1, 2, or 3');
 }
 
 if ($diamond == 1) {
-    $blastp = 'diamond'
+    $blastp = 'diamond';
+    say "This VirSorter run uses `diamond` (Buchfink et al., Nature Methods 2015) instead of `blastp`.\n";
 }
 
 say map { sprintf "%-15s: %s\n", @$_ } (
@@ -104,31 +117,48 @@ say map { sprintf "%-15s: %s\n", @$_ } (
     ['blastp',        $blastp],
 );
 
-if ($diamond == 1) {
-    say "This VirSorter run uses DIAMOND (Buchfink et al., Nature Methods 2015) instead of blastp.\n";
-}
+ 
 if ($tag_virome == 1) {
     say "WARNING: THIS WILL BE A VIROME DECONTAMINATION RUN";
 }
 
+if ($debug == 1){
+    say "This is a debug run === the result directory will not be nicely organized, but steps can be re-run independently\n";
+}
+
+if ($no_c == 1){
+    say "This is a 'no_c' run, so the C program in Step_3 will not be used and instead everything will be done in perl\n";
+}
+
+# Check if "working directory" already exists
+if (-d "$wdir") {
+    verbose("WARNING");
+    say STDERR "Working directory already present: \"$wdir\".\nIf this contains an aborted run, the script will terminate!\n";
+}
 # Need 2 databases
 # PCs from Refseq (phages) or PCs from Refseq+Viromes
 # PFAM (27.0)
 
-my $path_hmmsearch     = which('hmmsearch') or die "Missing hmmsearch\n";
-my $path_blastp        = which('blastp')    or die "Missing blastp\n";
+my $path_hmmsearch     = which('hmmsearch') or die "FATAL ERROR: `hmmsearch` is not in the \$PATH\n";
+my $path_blastp        = which('blastp')    or die "FATAL ERROR: `blastp` is not in the \$PATH\n";
 my $path_diamond       = '';
 my $script_dir         = catdir($Bin, 'Scripts');
 my $dir_Phage_genes    = catdir($data_dir,'Phage_gene_catalog');
 my $readme_file        = catfile($data_dir, 'VirSorter_Readme.txt');
 my $ref_phage_clusters = catfile($data_dir,
                          'Phage_gene_catalog', 'Phage_Clusters_current.tab');
+
+verbose("hmmsearch: $path_hmmsearch");
+verbose("blastp:    $path_blastp");
+verbose("diamond:   $path_diamond");
 if ($diamond == 1) {
-    $path_diamond      = which('diamond')   or die "Missing diamond\n";
+    $path_diamond      = which('diamond')   or die "FATAL ERROR: `diamond` is not in the \$PATH\n";
+    verbose("Diamond path found: $path_diamond");
 }
 
 if ($tag_virome == 1) {
     $readme_file = catfile($data_dir, 'VirSorter_Readme_viromes.txt');
+    verbose("VirSorter readme found: $readme_file");
 }
 
 my $generic_ref_file = catfile($data_dir,'Generic_ref_file.refs');
@@ -169,15 +199,19 @@ my $fastadir = catdir($wdir, 'fasta');
 if ( !-d $fastadir ) {
     mkpath($fastadir);
     my $fna_file = catfile($fastadir, 'input_sequences.fna');
+    my $tsv_file = catfile($fastadir, 'input_sequences_id_translation.tsv');
     open my $fa, '<', $input_file;
     open my $s1, '>', $fna_file;
+    open my $s2, '>', $tsv_file;
 
     while (<$fa>) {
         chomp($_);
         if ( $_ =~ /^>(.*)/ ) {
             my $id = $1;
+            print $s2 $id."\t";
             $id =~ s/[\/\.,\|\s?!\*%]/_/g;
             my $new_id = $code_dataset . "_" . $id;
+            print $s2 $new_id."\n";
             say $s1 ">$new_id";
         }
         else {
@@ -187,6 +221,7 @@ if ( !-d $fastadir ) {
     }
     close $fa;
     close $s1;
+    close $s2;
 
     # detect circular, predict genes on contigs and extract proteins, as well
     # as filtering on size (nb genes) and/or circular
@@ -207,6 +242,10 @@ say "\t$out";
 my $fasta_contigs_nett 
     = catfile($fastadir, $code_dataset . "_nett_filtered.fasta");
 my $fasta_file_prots = catfile($fastadir, $code_dataset . "_prots.fasta");
+
+if (!(-e $fasta_file_prots && -e $fasta_contigs_nett)){
+	die("Step 1 failed, we stop there: either $fasta_file_prots or $fasta_contigs_nett were not found\n");
+}
 
 # Match against PFAM, once for all
 # compare to PFAM a then b (hmmsearch)
@@ -269,20 +308,16 @@ my $cmd_merge
     . "$out_file_affi >> $log_out 2>> $log_err";
 
 my $script_detect = catfile($script_dir, "Step_3_highlight_phage_signal.pl");
-my $cmd_detect 
-    = "$script_detect $out_file_affi $out_file_phage_fragments $n_cpus "
-    . ">> $log_out 2>> $log_err";
-
+my $cmd_detect = "$script_detect -csv $out_file_affi -out $out_file_phage_fragments -n_cpu $n_cpus -no_c $no_c ". ">> $log_out 2>> $log_err";
+my $ref_file = $out_file_affi;
+$ref_file =~ s/\.csv/.refs/g;
+my $cmd_detect_rd1 = "$script_detect -csv $out_file_affi -out $out_file_phage_fragments -n_cpu $n_cpus -no_c $no_c ". "-ref $ref_file >> $log_out 2>> $log_err"; ## for use after rd1
 if ($tag_virome == 1) {
-    $cmd_detect 
-        = "$script_detect $out_file_affi $out_file_phage_fragments $n_cpus "
-        . "$generic_ref_file >> $log_out 2>> $log_err";
+    $cmd_detect = "$script_detect -csv $out_file_affi -out $out_file_phage_fragments -n_cpu $n_cpus -no_c $no_c ". "-ref $generic_ref_file >> $log_out 2>> $log_err";
 }
 
 my $script_summary = catfile($script_dir, "Step_4_summarize_phage_signal.pl");
-my $cmd_summary 
-    = "$script_summary $out_file_affi $out_file_phage_fragments "
-    . "$global_out_file $new_prots_to_cluster >> $log_out 2>> $log_err";
+my $cmd_summary = "$script_summary $out_file_affi $out_file_phage_fragments " . "$global_out_file $new_prots_to_cluster >> $log_out 2>> $log_err";
 
 # # Get the final result file ready
 `touch $global_out_file`;
@@ -301,8 +336,7 @@ while ( (-e $new_prots_to_cluster || $r_n == -1) && ($r_n<=10) ) {
         say "Out : $out";
 
         ## Clustering of the new prots with the unclustered
-        my $script_new_cluster 
-            = catfile($script_dir, "Step_0_make_new_clusters.pl");
+        my $script_new_cluster  = catfile($script_dir, "Step_0_make_new_clusters.pl");
         
         # First revision, we just import the Refseq database
         if ( $r_n == 0 ) {
@@ -327,6 +361,11 @@ while ( (-e $new_prots_to_cluster || $r_n == -1) && ($r_n<=10) ) {
 				    
                 say "Adding custom phage to the database : \n$add_first\n";
                 $out = `$add_first`;
+                ## Test that everything went all right, if not die there
+                my $test=catfile($dir_revision,"/db/Pool_new_unclustered.faa");
+                if (!(-e $test)){
+			die("There was a problem with the custom phage sequence processing, please double-check that a fasta file of nucleotide sequence(s) is provided with the option --cp");
+                }
             }
             # should replace Pool_cluster / Pool_unclustered and
             # Pool_new_unclustered else , we just import the Refseq database
@@ -359,6 +398,8 @@ while ( (-e $new_prots_to_cluster || $r_n == -1) && ($r_n<=10) ) {
             # clustered
             $out = `rm $new_prots_to_cluster`;
             #print "rm $new_prots_to_cluster -> $out\n";
+            ## From now on, we use the ref file that was generated with r_0 (or cp pasted from external ref if virome)
+            $cmd_detect = $cmd_detect_rd1;
         }
 
         # Check if there are some data in these new clusters, or if all the new
@@ -429,7 +470,7 @@ while ( (-e $new_prots_to_cluster || $r_n == -1) && ($r_n<=10) ) {
                 "--out $out_blast_new_unclustered",
                 "--threads $n_cpus", 
                 "--outfmt 6",
-                "-b 2", #Uses at most approx. b * 6 GB of RAM. -b 2 will use at most ~12 GB of RAM.
+                "-b 1", #Uses at most approx. b * 6 GB of RAM. -b 1 will use at most ~6 GB of RAM. ## Changed to -b 1 to avoid oom issues
                 "--more-sensitive",
                 "-k 500", #This is the default max sequences for blastp
                 "--evalue 0.001 >> $log_out 2>> $log_err"
@@ -442,9 +483,13 @@ while ( (-e $new_prots_to_cluster || $r_n == -1) && ($r_n<=10) ) {
         $out = `$cmd_blast_unclustered`;
 
         say "\t$out";
-        $out = `cat $out_blast_new_unclustered >> $out_blast_unclustered`;
-
-        say "\t$out";
+        if (-e $out_blast_new_unclustered){
+		$out = `cat $out_blast_new_unclustered >> $out_blast_unclustered`;
+		say "\t$out";
+	}
+	else{
+		say "\tNo file $out_blast_new_unclustered, nothing new to add to $out_blast_unclustered\n";
+	}
 
         # Make backup of the previous files to have 
         # trace of the different steps
@@ -508,6 +553,15 @@ say "\nStep 5 : $cmd_step_5";
 
 $out = `$cmd_step_5`;
 say "\t$out";
+
+# New check: verify the final result in terms of bp to see if we should print a warning to maybe use the Virome Decontamination mode
+if ($tag_virome != 1){
+	&check_for_decontamination($wdir,$fasta_contigs_nett,$code_dataset);
+}
+
+if ($debug==1){
+	die("We stop there, we are in debug mode, so we don't rearrange the output directory\n");
+}
 
 # Plus clean the output directory
 say "Cleaning the output directory";
@@ -612,4 +666,83 @@ sub safe_mv {
     return unless -e $src;
     return unless -e $src;
     `mv $src $dest`;
+}
+
+sub verbose {
+	my ($text) = @_;
+	return unless ($opt_verbose);
+	print STDERR color('yellow'), ""  unless (defined $ENV{'NO_COLOR'});
+	say STDERR  " * $text";
+	print STDERR color('reset'), "" unless (defined $ENV{'NO_COLOR'});
+}
+
+sub check_for_decontamination {
+	my $dir_out = catdir($_[0], "Predicted_viral_sequences");
+	my $in_fasta = $_[1];
+	my $code = $_[2];
+	my $out_file_1  = catfile( $dir_out, $code . '_cat-1.fasta' );
+	my $out_file_2  = catfile( $dir_out, $code . '_cat-2.fasta' );
+	my $out_file_3  = catfile( $dir_out, $code . '_cat-3.fasta' );
+	my $out_file_p1 = catfile( $dir_out, $code . '_prophages_cat-4.fasta' );
+	my $out_file_p2 = catfile( $dir_out, $code . '_prophages_cat-5.fasta' );
+	my $out_file_p3 = catfile( $dir_out, $code . '_prophages_cat-6.fasta' );
+	my %count;
+	$count{"viral"}=0;
+	$count{"total"}=0;
+	my %check;
+	my %store_len;
+	### Check all contigs 10kb+ and take the total cumulated length of these
+	open my $fa,"<",$in_fasta;
+	my $c_c="";
+	my $c_seq=0;
+	while(<$fa>){
+		chomp($_);
+		if ($_=~/^>(\S+)/){
+			my $tmp=$1;
+			if ($c_seq>=10000){
+				$check{$c_c}=1;
+				$count{"total"}+=$c_seq;
+				$store_len{$c_c}=$c_seq;
+			}
+			$c_c=$tmp;
+			$c_seq=0;
+		}
+		else{
+			$c_seq+=length($_);
+		}
+	}
+	close $fa;
+	if (length($c_seq)>=10000){
+		$check{$c_c}=1;
+		$count{"total"}+=$c_seq;
+		$store_len{$c_c}=$c_seq;
+	}
+	if (-e $out_file_1 || -e $out_file_2 || -e $out_file_3){
+		open my $fa_2,"cat $out_file_1 $out_file_2 $out_file_3 |";
+		while(<$fa_2>){
+			chomp($_);
+			if ($_=~/^>(\S+)-cat_\d/){$count{"viral"}+=$store_len{$1};}
+		}
+		close $fa_2;
+	}
+	if (-e $out_file_p1 || -e $out_file_p2 || -e $out_file_p3){
+		open my $fa_3,"cat $out_file_p1 $out_file_p2 $out_file_p3 |";
+		while(<$fa_3>){
+			chomp($_);
+			if ($_=~/^>\S+-gene_\d+_gene_\d+-(\d+)-(\d+)-cat_\d/){$count{"viral"}+=($2-$1+1);}
+		}
+		close $fa_3;
+	}
+	
+	if ($count{"total"}==0){}
+	else{
+		print "## Verify if this should have been a virome decontamination mode based on 10kb+ contigs\n";
+		my $ratio=$count{"viral"}/$count{"total"};
+		if ($ratio>0.25){
+			print "#!#!#!#!#!#!#!#!#!#!#!#!#!#!#!#!##!#!#!#!#!#!#!#!##!#!#!#!#!#!#!#!#\n";
+			print "More than 25% of the bp in contigs >= 10kb were predicted as viral (estimated ratio: ".sprintf("%.02f",$ratio*100)."%\n";
+			print "You may want to use the virome decontamination mode on this dataset, as it seems to have lot of viruses\n";
+			print "#!#!#!#!#!#!#!#!#!#!#!#!#!#!#!#!##!#!#!#!#!#!#!#!##!#!#!#!#!#!#!#!#\n";
+		}
+	}
 }
